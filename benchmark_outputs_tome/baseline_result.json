@@ -1,0 +1,10 @@
+{
+  "method": "baseline",
+  "ratio": 0.3,
+  "deviation": 0.2,
+  "macs_t": 6.01,
+  "latency_s": 19.23,
+  "latency_std": 0.07,
+  "steps": 50,
+  "seed": 42
+}

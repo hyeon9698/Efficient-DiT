@@ -1,0 +1,10 @@
+{
+  "method": "tome",
+  "ratio": 0.85,
+  "deviation": 0.2,
+  "macs_t": 4.56,
+  "latency_s": 14.88,
+  "latency_std": 0.05,
+  "steps": 50,
+  "seed": 42
+}
