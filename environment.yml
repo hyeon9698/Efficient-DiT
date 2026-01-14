@@ -1,0 +1,30 @@
+name: sdtm_pixart
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch=2.1.1
+  - torchvision=0.16.1
+  - torchaudio=2.1.1
+  - pytorch-cuda=12.1
+  - numpy<2
+  - pillow
+  - tqdm
+  - scipy
+  - pandas
+  - matplotlib
+  - regex
+  - pip:
+    - diffusers==0.27.2
+    - transformers==4.41.2
+    - accelerate==0.25.0
+    - sentencepiece
+    - safetensors
+    - einops
+    - timm
+    - tabulate
+    - huggingface_hub==0.23.0
