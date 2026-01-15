@@ -216,33 +216,7 @@ def compute_merge(x: torch.Tensor, tore_info: Dict[str, Any]) -> Tuple[Callable,
     w = int(math.sqrt(x.shape[1]))
     h = w
     assert w * h == x.shape[1], "Input must be square"
-
-    # Get base ratio and current state
-    base_ratio = tore_info["args"]["ratio"]
-    layer_current = tore_info["states"]["layer_current"]
-    step_current = tore_info["states"]["step_current"]
-    step_count = tore_info["states"]["step_count"]
-
-    # 1. Linear Interpolation: ratio increases linearly over steps
-    # step 0 -> ratio=0, final step -> ratio=base_ratio
-    if step_count > 1:
-        step_factor = step_current / (step_count - 1)
-    else:
-        step_factor = 1.0
-    interpolated_ratio = base_ratio * step_factor
-
-    # 2. Staggered Compression Pattern (every 4 blocks)
-    # Block 0: no compression, Block 1: standard, Block 2: reduced (half), Block 3: standard
-    block_pattern = layer_current % 4
-    if block_pattern == 0:
-        # No compression
-        ratio_current = 1.0
-    elif block_pattern == 2:
-        # Reduced compression (half)
-        ratio_current = 1.0 - interpolated_ratio / 2
-    else:  # block_pattern == 1 or 3
-        # Standard compression
-        ratio_current = 1.0 - interpolated_ratio
+    ratio_current = tore_info["states"]["ratio_current"]
 
     reduce_num = int(x.shape[1] * (1 - ratio_current))
 
@@ -292,9 +266,6 @@ def make_ToMe_model(model_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]
         _parent = model_class
 
         def forward(self, *args, **kwargs):
-            # Skip if _tore_info is not available (e.g., during ptflops measurement)
-            if not hasattr(self, '_tore_info') or self._tore_info is None:
-                return super().forward(*args, **kwargs)
             self._tore_info["states"]["layer_count"] = self.config.num_layers
             self._tore_info["states"]["step_current"] = self._tore_info["states"]["step_iter"].pop(0)
             self._tore_info["states"]["layer_iter"] = list(range(self.config.num_layers))
@@ -317,23 +288,20 @@ def make_ToMe_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]
             temb: torch.FloatTensor,
             joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         ):
-            # Skip if _tore_info is not available (e.g., during ptflops measurement)
-            if not hasattr(self, '_tore_info') or self._tore_info is None:
-                return super().forward(hidden_states, encoder_hidden_states, temb, joint_attention_kwargs)
 
             self._tore_info["states"]["layer_current"] = self._tore_info["states"]["layer_iter"].pop(0)
             step_current = self._tore_info["states"]["step_current"]
             layer_current = self._tore_info["states"]["layer_current"]
 
             joint_attention_kwargs = joint_attention_kwargs or {}
-            if getattr(self, 'use_dual_attention', False):
+            if self.use_dual_attention:
                 norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp, norm_hidden_states2, gate_msa2 = self.norm1(
                     hidden_states, emb=temb
                 )
             else:
                 norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
 
-            if getattr(self, 'context_pre_only', False):
+            if self.context_pre_only:
                 norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states, temb)
             else:
                 norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
@@ -341,7 +309,7 @@ def make_ToMe_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]
                 )
             #! Step 1: Compute_Merge
             m_a, _, m_m, u_a, _, u_m = compute_merge(norm_hidden_states, self._tore_info)
-            if getattr(self, 'use_dual_attention', False):
+            if self.use_dual_attention:
                 m_a2, _, _, u_a2, _, _ = compute_merge(norm_hidden_states2, self._tore_info)
 
             #! Step 2_1: Merge_Attn
@@ -361,7 +329,7 @@ def make_ToMe_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]
 
             hidden_states = hidden_states + attn_output
 
-            if getattr(self, 'use_dual_attention', False):
+            if self.use_dual_attention:
                 #! Step 2_3: Merge_DualAttn
                 norm_hidden_states2 = m_a2(norm_hidden_states2)
 
@@ -392,7 +360,7 @@ def make_ToMe_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]
             hidden_states = hidden_states + ff_output
 
             # Process attention outputs for the `encoder_hidden_states`.
-            if getattr(self, 'context_pre_only', False):
+            if self.context_pre_only:
                 encoder_hidden_states = None
             else:
                 context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
