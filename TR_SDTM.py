@@ -118,16 +118,11 @@ def SSM(
             node_mean=node_mean.repeat(1,n_H)
             reduce_num = torch.ge(ssmscore_map, node_mean).sum(dim=1).min()
         else:
-            reduce_num = reduce_num // 48 * 16
+            reduce_num = reduce_num // 48 * 16 
 
-        # -------------#
-
-        # Clamp reduce_num to available windows (prevents crash with high ratio+deviation)
-        num_windows = ssmscore_map.shape[-1]
-        if reduce_num > num_windows:
-            reduce_num = num_windows
-
-        #   get top k similar super patches
+        # -------------# 
+    
+        #   get top k similar super patches 
         _, sim_super_patch_idxs = ssmscore_map.topk(reduce_num, dim=-1)
     
         # --- creating the mergabel and unmergable super  pathes
@@ -232,6 +227,9 @@ def SSM(
             return x
 
         def unmerge(x: torch.Tensor) -> torch.Tensor:
+            # Determine cache_name directly from phase state; align with features dict keys
+           
+
             unm_len = unm_idx.shape[1]
             unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
             _, tu, c = unm.shape
@@ -240,8 +238,10 @@ def SSM(
 
             # Optional fusion with cached features for dst/src tokens
             # unm: keep as-is; dst/src: fuse computed with cached by mcw
-            cache_name = tore_info["states"].get("unmerge_phase", None)
-            if cache_name in ("attn_output", "attn_output2", "mlp_output"):
+            try:
+                cache_name = tore_info["states"].get("unmerge_phase", None)
+                if cache_name not in ("attn_output", "attn_output2", "mlp_output"):
+                    pass
                 mcw = float(tore_info.get("args", {}).get("mcw", 1.0))
                 l = tore_info.get("states", {}).get("layer_current", -1)
                 key = f"l{l}"
@@ -255,6 +255,8 @@ def SSM(
                     # fuse
                     dst = mcw * dst + (1.0 - mcw) * cached_dst
                     src = mcw * src + (1.0 - mcw) * cached_src
+            except Exception:
+                pass  # best-effort fusion; fallback to computed values
 
             # Combine back to the original shape
             out = torch.zeros(B, N, c, device=x.device, dtype=x.dtype)
@@ -377,25 +379,6 @@ def FIDM(
 
         # Find the most similar greedily
         node_max, node_idx = scores.max(dim=-1)
-
-        # Frequency priority per paper Section 4.1.1: P_x = P_ina + a_d * P_fre
-        # T_x = time since last merged. last_independent is INVERSELY proportional to T_x:
-        # - HIGH last_independent = merged continuously = LOW T_x = should be PROTECTED
-        # - LOW last_independent = independent recently = HIGH T_x = should be merged
-        # SUBTRACT to protect frequently-merged tokens (fairness mechanism)
-        use_li_freq = (
-            tore_info is not None and "states" in tore_info and
-            tore_info["states"].get("last_independent") is not None
-        )
-        if use_li_freq:
-            li = tore_info["states"]["last_independent"]
-            li_src = gather(li.unsqueeze(-1).float(), dim=1, index=a_idx.expand(B, a_idx.shape[1], 1)).squeeze(-1)
-            eps = 1e-6
-            mean_freq = li_src.mean(dim=-1, keepdim=True) + eps
-            norm_freq_priority = li_src / mean_freq
-            a_d = tore_info["args"]["a_d"]
-            node_max = node_max - a_d * norm_freq_priority  # SUBTRACT to protect merged tokens
-
         edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
 
         unm_idx = edge_idx[..., reduce_num:, :]  # Unmerged Tokens
@@ -456,8 +439,11 @@ def FIDM(
             src = gather(dst, dim=-2, index=dst_idx.expand(B, reduce_num, c))
 
             # Optional fusion with cached features for dst/src tokens (unm remains as-is)
-            cache_name = tore_info.get("states", {}).get("unmerge_phase", None)
-            if cache_name in ("attn_output", "attn_output2", "mlp_output"):
+            try:
+                # Determine cache_name directly from phase state; align with features dict keys
+                cache_name = tore_info.get("states", {}).get("unmerge_phase", None)
+                if cache_name not in ("attn_output", "attn_output2", "mlp_output"):
+                    pass
                 mcw = float(tore_info.get("args", {}).get("mcw", 1.0))
                 l = tore_info.get("states", {}).get("layer_current", -1)
                 key = f"l{l}"
@@ -471,17 +457,19 @@ def FIDM(
                     # fuse
                     dst = mcw * dst + (1.0 - mcw) * cached_dst
                     src = mcw * src + (1.0 - mcw) * cached_src
+            except Exception:
+                pass  # best-effort fusion; fallback to computed values
 
             # Combine back to the original shape
             out = torch.zeros(B, N, c, device=x.device, dtype=x.dtype)
-            # NOTE: a_idx is (a in x) b_idx is (dst in x),
+            # NOTE: a_idx is (a in x) b_idx is (dst in x), 
             # NOTE: dst_idx is (src in dst), unm_idx is (unm in a), (src_idx) is (src in a)
 
             out.scatter_(dim=-2, index=dst_in_x_index.expand(B, dst_in_x_index.shape[1], c), src=dst)
             out.scatter_(dim=-2, index=unm_in_x_index.expand(B, unm_in_x_index.shape[1], c), src=unm)
             out.scatter_(dim=-2, index=src_in_x_index.expand(B, src_in_x_index.shape[1], c), src=src)
             return out
-
+    
     return merge, mprune, unmerge
 
 
@@ -715,12 +703,16 @@ def make_SDTM_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]
 
             # helper: store intermediate features by (step, layer), device configurable
             def _store_feature(name: str, tensor: torch.Tensor):
-                feat = self._tore_info.setdefault("features", {})
-                if not isinstance(feat.get(name), dict):
-                    feat[name] = {}
-                l = self._tore_info.get("states", {}).get("layer_current", -1)
-                key = f"l{l}"
-                feat[name][key] = tensor.detach()
+                try:
+                    feat = self._tore_info.setdefault("features", {})
+                    if not isinstance(feat.get(name), dict):
+                        feat[name] = {}
+                    l = self._tore_info.get("states", {}).get("layer_current", -1)
+                    key = f"l{l}"
+                    feat[name][key] = tensor.detach()
+                except Exception:
+                    # best-effort; do not break the forward pass if logging fails
+                    pass
 
             if protected_step:
                 attn_output, context_attn_output = self.attn(
@@ -819,7 +811,7 @@ def make_SDTM_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]
 
 def apply_SDTM(
     pipe: torch.nn.Module,
-    ratio: float = 0.3,
+    ratio: float = 0.5,
     deviation: float = 0.2,
     switch_step: int = 20,
     use_rand: bool = True,
@@ -829,12 +821,11 @@ def apply_SDTM(
     a_d: float = 0.05,
     a_p: float = 2,
     pseudo_merge: bool = False,
-    mcw: float = 0.1,
-    protect_steps_frequency: int = 3,
-    protect_layers_frequency: int = -1,
-    merge_attn: bool = True,
-    merge_mlp: bool = True,
-    cache_each_step: bool = True,
+    mcw: float = 0.2,
+    protect_steps_frequency: int = None,
+    protect_layers_frequency: int = None,
+    merge_attn: bool = False,
+    merge_mlp: bool = False,
 ):
 
     # Make sure the module is not currently patched
@@ -859,7 +850,7 @@ def apply_SDTM(
             "protect_steps_frequency": protect_steps_frequency,
             "protect_layers_frequency": protect_layers_frequency,
             "generator": None,
-            "cache_each_step": cache_each_step,
+            "cache_each_step": False,
         },
         "features": {
             "attn_output": None,
@@ -890,9 +881,10 @@ def apply_SDTM(
             make_block_fn = make_SDTM_block
             module.__class__ = make_block_fn(module.__class__)
             module._tore_info = pipe._tore_info
-            # Set use_dual_attention to False (we don't support dual attention in SDTM)
-            # Keep context_pre_only as-is (some blocks need this to be True)
-            module.use_dual_attention = False
-            if not hasattr(module, 'context_pre_only'):
-                module.context_pre_only = False
+            # Disable dual attention on patched blocks to simplify behavior
+            try:
+                module.use_dual_attention = False
+            except Exception:
+                pass
+    # Note: attention map collection is handled by _call_attn_with_get_scores so no global monkeypatch is needed.
     return pipe
