@@ -101,7 +101,7 @@ def run_inference(pipe, prompt, steps, seed, device, save_path=None):
 def main():
     parser = argparse.ArgumentParser(description="SDTM Benchmark")
     parser.add_argument("--method", type=str, required=True,
-                        choices=["baseline", "sdtm", "tome"])
+                        choices=["baseline", "sdtm", "tome", "atedm", "atedm_v2", "atedm_v4", "atedm_v5", "atedm_paper"])
     parser.add_argument("--ratio", type=float, default=0.3)
     parser.add_argument("--deviation", type=float, default=0.2)
     parser.add_argument("--steps", type=int, default=50)
@@ -143,15 +143,27 @@ def main():
     if args.method == "sdtm":
         from TR_SDTM import apply_SDTM
 
-        switch_step = int(args.steps * 0.4)
+        switch_step = 20  # Fixed per paper SDTM*-a configuration
 
         apply_SDTM(
             pipe,
             ratio=args.ratio,
             deviation=args.deviation,
             switch_step=switch_step,
+            use_rand=True,  # Explicit per paper
+            a_s=0.05,
+            a_d=0.05,  # Frequency priority in IDM phase
+            mcw=0.1,
+            protect_steps_frequency=3,
+            protect_layers_frequency=-1,
+            merge_attn=True,
+            merge_mlp=True,
+            cache_each_step=True,
         )
-        print(f"\nApplied SDTM (ratio={args.ratio}, deviation={args.deviation}, switch_step={switch_step})")
+        print(f"\nApplied SDTM* (dynamic compression)")
+        print(f"  ratio={args.ratio}, deviation={args.deviation}")
+        print(f"  switch_step={switch_step}, protect_steps_frequency=3")
+        print(f"  merge_attn=True, merge_mlp=True, cache_each_step=True")
         tore_info = pipe._tore_info
 
     # Apply ToMe if needed
@@ -166,6 +178,52 @@ def main():
             merge_mlp=merge_mlp,
         )
         print(f"\nApplied ToMe (ratio={args.ratio}, merge_mlp={merge_mlp})")
+        tore_info = pipe._tore_info
+
+    # Apply AT-EDM if needed
+    elif args.method == "atedm":
+        from TR_ATEDM import apply_ATEDM
+        apply_ATEDM(
+            pipe,
+            ratio=args.ratio,
+        )
+        print(f"\nApplied AT-EDM (ratio={args.ratio})")
+        tore_info = pipe._tore_info
+
+    elif args.method == "atedm_v2":
+        from TR_ATEDM_v2 import apply_ATEDM
+        apply_ATEDM(
+            pipe,
+            ratio=args.ratio,
+        )
+        print(f"\nApplied AT-EDM v2 (ratio={args.ratio})")
+        tore_info = pipe._tore_info
+
+    elif args.method == "atedm_v4":
+        from TR_ATEDM_v4 import apply_ATEDM
+        apply_ATEDM(
+            pipe,
+            ratio=args.ratio,
+        )
+        print(f"\nApplied AT-EDM v4 (ratio={args.ratio})")
+        tore_info = pipe._tore_info
+
+    elif args.method == "atedm_v5":
+        from TR_ATEDM_v5 import apply_ATEDM
+        apply_ATEDM(
+            pipe,
+            ratio=args.ratio,
+        )
+        print(f"\nApplied AT-EDM v5 (ratio={args.ratio})")
+        tore_info = pipe._tore_info
+
+    elif args.method == "atedm_paper":
+        from TR_ATEDM_paper import apply_ATEDM
+        apply_ATEDM(
+            pipe,
+            ratio=args.ratio,
+        )
+        print(f"\nApplied AT-EDM Paper (ratio={args.ratio})")
         tore_info = pipe._tore_info
 
     # Measure MACs with hooks during actual inference (also serves as warmup)
@@ -183,8 +241,18 @@ def main():
                 save_path = str(output_dir / "baseline.png")
             elif args.method == "sdtm":
                 save_path = str(output_dir / f"sdtm_r{args.ratio}_d{args.deviation}.png")
-            else:  # tome
+            elif args.method == "tome":
                 save_path = str(output_dir / f"tome_r{args.ratio}.png")
+            elif args.method == "atedm":
+                save_path = str(output_dir / f"atedm_r{args.ratio}.png")
+            elif args.method == "atedm_v2":
+                save_path = str(output_dir / f"atedm_v2_r{args.ratio}.png")
+            elif args.method == "atedm_v4":
+                save_path = str(output_dir / f"atedm_v4_r{args.ratio}.png")
+            elif args.method == "atedm_v5":
+                save_path = str(output_dir / f"atedm_v5_r{args.ratio}.png")
+            else:  # atedm_paper
+                save_path = str(output_dir / f"atedm_paper_r{args.ratio}.png")
         else:
             save_path = None
         lat = run_inference(pipe, args.prompt, args.steps, args.seed, args.device, save_path)
@@ -210,8 +278,18 @@ def main():
         result_file = output_dir / "baseline_result.json"
     elif args.method == "sdtm":
         result_file = output_dir / f"sdtm_r{args.ratio}_d{args.deviation}_result.json"
-    else:  # tome
+    elif args.method == "tome":
         result_file = output_dir / f"tome_r{args.ratio}_result.json"
+    elif args.method == "atedm":
+        result_file = output_dir / f"atedm_r{args.ratio}_result.json"
+    elif args.method == "atedm_v2":
+        result_file = output_dir / f"atedm_v2_r{args.ratio}_result.json"
+    elif args.method == "atedm_v4":
+        result_file = output_dir / f"atedm_v4_r{args.ratio}_result.json"
+    elif args.method == "atedm_v5":
+        result_file = output_dir / f"atedm_v5_r{args.ratio}_result.json"
+    else:  # atedm_paper
+        result_file = output_dir / f"atedm_paper_r{args.ratio}_result.json"
     with open(result_file, "w") as f:
         json.dump(result, f, indent=2)
 
@@ -257,6 +335,15 @@ def aggregate_results(output_dir="./benchmark_outputs"):
             data["speed"] = round(baseline_latency / data["latency_s"], 2)
         results.append(data)
 
+    # Load AT-EDM results (sorted by ratio)
+    atedm_files = sorted(output_dir.glob("atedm_r*_result.json"))
+    for path in atedm_files:
+        with open(path) as f:
+            data = json.load(f)
+        if baseline_latency:
+            data["speed"] = round(baseline_latency / data["latency_s"], 2)
+        results.append(data)
+
     if not results:
         print("No results found.")
         return
@@ -274,18 +361,22 @@ def aggregate_results(output_dir="./benchmark_outputs"):
             method_name = "SDTM"
         elif r["method"] == "tome":
             method_name = "ToMe"
+        elif r["method"] == "atedm":
+            method_name = "AT-EDM"
         rows.append([
             method_name,
-            "-" if r["method"] == "baseline" else f"{r['ratio']:.1f}",
-            "-" if r["method"] == "baseline" or r["method"] == "tome" else f"{r['deviation']:.1f}",
+            "-" if r["method"] == "baseline" else f"{r['ratio']:.2f}",
+            "-" if r["method"] in ("baseline", "tome", "atedm") else f"{r['deviation']:.1f}",
             f"{r['macs_t']:.2f}",
             f"{r['latency_s']:.2f}",
-            f"{r.get('speed', '-'):.2f}x"
+            f"{r.get('speed', 1.0):.2f}x"
         ])
 
     # Add paper reference
     rows.append(["---", "---", "---", "---", "---", "---"])
     rows.append(["Paper Baseline", "-", "-", "6.01", "10.67*", "1.00x"])
+    rows.append(["Paper ToMeSD-a", "-", "-", "4.27", "8.08*", "1.32x"])
+    rows.append(["Paper AT-EDM-a", "-", "-", "4.23", "8.14*", "1.31x"])
     rows.append(["Paper SDTM*-a", "?", "?", "4.20", "8.20*", "1.30x"])
 
     print(tabulate(rows, headers=headers, tablefmt="simple"))

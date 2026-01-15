@@ -118,11 +118,16 @@ def SSM(
             node_mean=node_mean.repeat(1,n_H)
             reduce_num = torch.ge(ssmscore_map, node_mean).sum(dim=1).min()
         else:
-            reduce_num = reduce_num // 48 * 16 
+            reduce_num = reduce_num // 48 * 16
 
-        # -------------# 
-    
-        #   get top k similar super patches 
+        # -------------#
+
+        # Clamp reduce_num to available windows (prevents crash with high ratio+deviation)
+        num_windows = ssmscore_map.shape[-1]
+        if reduce_num > num_windows:
+            reduce_num = num_windows
+
+        #   get top k similar super patches
         _, sim_super_patch_idxs = ssmscore_map.topk(reduce_num, dim=-1)
     
         # --- creating the mergabel and unmergable super  pathes
@@ -227,9 +232,6 @@ def SSM(
             return x
 
         def unmerge(x: torch.Tensor) -> torch.Tensor:
-            # Determine cache_name directly from phase state; align with features dict keys
-           
-
             unm_len = unm_idx.shape[1]
             unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
             _, tu, c = unm.shape
@@ -238,24 +240,21 @@ def SSM(
 
             # Optional fusion with cached features for dst/src tokens
             # unm: keep as-is; dst/src: fuse computed with cached by mcw
-            cache_each_step = tore_info.get("args", {}).get("cache_each_step", False)
-            if cache_each_step:
-                cache_name = tore_info["states"].get("unmerge_phase", None)
-                if cache_name in ("attn_output", "attn_output2", "mlp_output"):
-                    mcw = float(tore_info.get("args", {}).get("mcw", 1.0))
-                    l = tore_info.get("states", {}).get("layer_current", -1)
-                    key = f"l{l}"
-                    cache_dict = tore_info.get("features", {}).get(cache_name, None)
-                    cache_full = cache_dict.get(key) if isinstance(cache_dict, dict) else None
-
-                    if cache_full is not None:
-                        cache_full = cache_full.to(device=x.device, dtype=x.dtype)
-                        # gather cached dst/src by original indices
-                        cached_dst = gather(cache_full, dim=1, index=dst_idx.expand(B, reduce_num, c))
-                        cached_src = gather(cache_full, dim=1, index=src_idx.expand(B, reduce_num*dim_index, c))
-                        # fuse
-                        dst = mcw * dst + (1.0 - mcw) * cached_dst
-                        src = mcw * src + (1.0 - mcw) * cached_src
+            cache_name = tore_info["states"].get("unmerge_phase", None)
+            if cache_name in ("attn_output", "attn_output2", "mlp_output"):
+                mcw = float(tore_info.get("args", {}).get("mcw", 1.0))
+                l = tore_info.get("states", {}).get("layer_current", -1)
+                key = f"l{l}"
+                cache_dict = tore_info.get("features", {}).get(cache_name, None)
+                cache_full = cache_dict.get(key) if isinstance(cache_dict, dict) else None
+                if cache_full is not None:
+                    cache_full = cache_full.to(device=x.device, dtype=x.dtype)
+                    # gather cached dst/src by original indices
+                    cached_dst = gather(cache_full, dim=1, index=dst_idx.expand(B, reduce_num, c))
+                    cached_src = gather(cache_full, dim=1, index=src_idx.expand(B, reduce_num*dim_index, c))
+                    # fuse
+                    dst = mcw * dst + (1.0 - mcw) * cached_dst
+                    src = mcw * src + (1.0 - mcw) * cached_src
 
             # Combine back to the original shape
             out = torch.zeros(B, N, c, device=x.device, dtype=x.dtype)
@@ -379,21 +378,23 @@ def FIDM(
         # Find the most similar greedily
         node_max, node_idx = scores.max(dim=-1)
 
-        # ---- Frequency priority score integration (a_d) ----
-        # Paper Section 4.1.2: P_x = P^{ina}_x + α_d × P^{fre}_x
-        # In FIDM, node_max acts as similarity score (proxy for inattentive)
-        # Add frequency priority weighted by a_d to prioritize tokens not recently merged
-        if use_li:
-            # Get frequency priority for src tokens (a tokens)
-            a_freq_priority = gather(li.float(), dim=1, index=a_idx.expand(B, a_idx.shape[1], 1).squeeze(-1))
-            # Normalize by mean
+        # Frequency priority per paper Section 4.1.1: P_x = P_ina + a_d * P_fre
+        # T_x = time since last merged. last_independent is INVERSELY proportional to T_x:
+        # - HIGH last_independent = merged continuously = LOW T_x = should be PROTECTED
+        # - LOW last_independent = independent recently = HIGH T_x = should be merged
+        # SUBTRACT to protect frequently-merged tokens (fairness mechanism)
+        use_li_freq = (
+            tore_info is not None and "states" in tore_info and
+            tore_info["states"].get("last_independent") is not None
+        )
+        if use_li_freq:
+            li = tore_info["states"]["last_independent"]
+            li_src = gather(li.unsqueeze(-1).float(), dim=1, index=a_idx.expand(B, a_idx.shape[1], 1)).squeeze(-1)
             eps = 1e-6
-            mean_freq = a_freq_priority.mean(dim=-1, keepdim=True) + eps
-            norm_freq_priority = a_freq_priority / mean_freq
-            # Apply a_d weight
+            mean_freq = li_src.mean(dim=-1, keepdim=True) + eps
+            norm_freq_priority = li_src / mean_freq
             a_d = tore_info["args"]["a_d"]
-            node_max = node_max + a_d * norm_freq_priority
-        # ------------------------------------------------------
+            node_max = node_max - a_d * norm_freq_priority  # SUBTRACT to protect merged tokens
 
         edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
 
@@ -452,42 +453,35 @@ def FIDM(
             unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
             _, _, c = unm.shape
 
-            # SSM-style: use explicit merge_idx for src reconstruction
-            # Each src[i] was merged into dst[dst_idx[i]], so copy dst[dst_idx[i]] back to src[i]
-            # Create merge_idx similar to SSM (maps each src position to its dst bucket)
-            merge_idx = dst_idx  # [B, reduce_num, 1] - each src's target dst index
-            src = gather(dst, dim=-2, index=merge_idx.expand(B, reduce_num, c))
+            src = gather(dst, dim=-2, index=dst_idx.expand(B, reduce_num, c))
 
             # Optional fusion with cached features for dst/src tokens (unm remains as-is)
-            cache_each_step = tore_info.get("args", {}).get("cache_each_step", False)
-            if cache_each_step:
-                cache_name = tore_info.get("states", {}).get("unmerge_phase", None)
-                if cache_name in ("attn_output", "attn_output2", "mlp_output"):
-                    mcw = float(tore_info.get("args", {}).get("mcw", 1.0))
-                    l = tore_info.get("states", {}).get("layer_current", -1)
-                    key = f"l{l}"
-                    cache_dict = tore_info.get("features", {}).get(cache_name, None)
-                    cache_full = cache_dict.get(key) if isinstance(cache_dict, dict) else None
-
-                    if cache_full is not None:
-                        cache_full = cache_full.to(device=x.device, dtype=x.dtype)
-                        # Gather cached values by original positions
-                        cached_dst = gather(cache_full, dim=1, index=dst_in_x_index.expand(B, dst_in_x_index.shape[1], c))
-                        cached_src = gather(cache_full, dim=1, index=src_in_x_index.expand(B, src_in_x_index.shape[1], c))
-                        # fuse
-                        dst = mcw * dst + (1.0 - mcw) * cached_dst
-                        src = mcw * src + (1.0 - mcw) * cached_src
+            cache_name = tore_info.get("states", {}).get("unmerge_phase", None)
+            if cache_name in ("attn_output", "attn_output2", "mlp_output"):
+                mcw = float(tore_info.get("args", {}).get("mcw", 1.0))
+                l = tore_info.get("states", {}).get("layer_current", -1)
+                key = f"l{l}"
+                cache_dict = tore_info.get("features", {}).get(cache_name, None)
+                cache_full = cache_dict.get(key) if isinstance(cache_dict, dict) else None
+                if cache_full is not None:
+                    cache_full = cache_full.to(device=x.device, dtype=x.dtype)
+                    # Gather cached values by original positions
+                    cached_dst = gather(cache_full, dim=1, index=dst_in_x_index.expand(B, dst_in_x_index.shape[1], c))
+                    cached_src = gather(cache_full, dim=1, index=src_in_x_index.expand(B, src_in_x_index.shape[1], c))
+                    # fuse
+                    dst = mcw * dst + (1.0 - mcw) * cached_dst
+                    src = mcw * src + (1.0 - mcw) * cached_src
 
             # Combine back to the original shape
             out = torch.zeros(B, N, c, device=x.device, dtype=x.dtype)
-            # NOTE: a_idx is (a in x) b_idx is (dst in x), 
+            # NOTE: a_idx is (a in x) b_idx is (dst in x),
             # NOTE: dst_idx is (src in dst), unm_idx is (unm in a), (src_idx) is (src in a)
 
             out.scatter_(dim=-2, index=dst_in_x_index.expand(B, dst_in_x_index.shape[1], c), src=dst)
             out.scatter_(dim=-2, index=unm_in_x_index.expand(B, unm_in_x_index.shape[1], c), src=unm)
             out.scatter_(dim=-2, index=src_in_x_index.expand(B, src_in_x_index.shape[1], c), src=src)
             return out
-    
+
     return merge, mprune, unmerge
 
 
@@ -647,12 +641,6 @@ def make_SDTM_pipe(pipe_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
             self._tore_info["states"]["step_count"] = kwargs['num_inference_steps']
             self._tore_info["states"]["step_iter"] = list(range(kwargs['num_inference_steps']))
             self._tore_info["states"]["last_independent"] = None
-            # Clear cache at the start of each inference run
-            self._tore_info["features"] = {
-                "attn_output": None,
-                "attn_output2": None,
-                "mlp_output": None,
-            }
             output = super().__call__(*args, **kwargs)
             return output
 
@@ -831,7 +819,7 @@ def make_SDTM_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]
 
 def apply_SDTM(
     pipe: torch.nn.Module,
-    ratio: float = 0.5,
+    ratio: float = 0.3,
     deviation: float = 0.2,
     switch_step: int = 20,
     use_rand: bool = True,
@@ -841,12 +829,12 @@ def apply_SDTM(
     a_d: float = 0.05,
     a_p: float = 2,
     pseudo_merge: bool = False,
-    mcw: float = 0.2,
+    mcw: float = 0.1,
+    protect_steps_frequency: int = 3,
+    protect_layers_frequency: int = -1,
+    merge_attn: bool = True,
+    merge_mlp: bool = True,
     cache_each_step: bool = True,
-    protect_steps_frequency: int = None,
-    protect_layers_frequency: int = None,
-    merge_attn: bool = False,
-    merge_mlp: bool = False,
 ):
 
     # Make sure the module is not currently patched
@@ -902,10 +890,9 @@ def apply_SDTM(
             make_block_fn = make_SDTM_block
             module.__class__ = make_block_fn(module.__class__)
             module._tore_info = pipe._tore_info
-            # Disable dual attention on patched blocks to simplify behavior
-            try:
-                module.use_dual_attention = False
-            except Exception:
-                pass
-    # Note: attention map collection is handled by _call_attn_with_get_scores so no global monkeypatch is needed.
+            # Set use_dual_attention to False (we don't support dual attention in SDTM)
+            # Keep context_pre_only as-is (some blocks need this to be True)
+            module.use_dual_attention = False
+            if not hasattr(module, 'context_pre_only'):
+                module.context_pre_only = False
     return pipe

@@ -1,0 +1,10 @@
+{
+  "method": "sdtm",
+  "ratio": 0.6,
+  "deviation": 0.2,
+  "macs_t": 4.06,
+  "latency_s": 15.21,
+  "latency_std": 0.07,
+  "steps": 50,
+  "seed": 42
+}

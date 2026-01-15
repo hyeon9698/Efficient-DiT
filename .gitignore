@@ -231,13 +231,11 @@ $RECYCLE.BIN/
 samples/
 .vscode/
 __pycache__/
-*.png
-*.jpg
-*.jpeg
-*.gif
+
 *.svg
 
 *.npz
 
+*.pdf
 
 Open-Sora/apex
